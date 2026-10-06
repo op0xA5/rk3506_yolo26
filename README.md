@@ -108,7 +108,53 @@ python3 scripts/quantize-int8.py models/yolo26n320_raw_fp32.onnx models/yolo26n3
 bash scripts/convert-model.sh models/*.onnx     # 注意: 传入所有在用模型, 配置为合并生成
 ```
 
-## 内存说明 (目标芯片可用内存 ~60MB)
+## NCNN 替换 onnxruntime (性能对比)
+
+`go-ncnn-demo/` 是功能对齐的 ncnn 版演示程序 (cgo 静态链接 libncnn.a),
+预处理/后处理代码与 go-yolo26n 完全一致，仅推理引擎不同，可直接对比。
+
+构建与转换:
+```bash
+pip3 install --user --break-system-packages pnnx   # 模型转换 (官方维护路径)
+make ncnn                 # 交叉编译 libncnn.a + go-ncnn-demo (首次自动克隆 ncnn)
+make ncnn-convert IMGSZ=480   # yolo26n.pt -> yolo26n480.ncnn.param/.bin + int8 量化
+```
+转换链: ultralytics 导出 torchscript -> **pnnx** 转 ncnn -> ncnn2table 校准
+-> ncnn2int8。不用 onnx2ncnn: 它对 YOLO26 检测头的 Shape/Gather/动态 Slice
+烘焙子图支持不完整 (fp16 守卫编译失败 + 转换后输出 NaN)，pnnx 能正确折叠。
+
+板端运行:
+```
+./ncnn-demo -model yolo26n480-int8.ncnn.param -size 480 -threads 3 -image bus.jpg
+```
+
+### qemu 对比 (480, int8, threads=2; 绝对值不代表真实芯片)
+
+| 引擎 | 模型 | 推理 | 后处理 | 加载后 VmRSS |
+|---|---|---|---|---|
+| onnxruntime | yolo26n480_nms_int8.ort (e2e) | ~2458ms | 0.3ms (解码) | ~40MB |
+| ncnn | yolo26n480-int8 (raw+Go NMS) | ~2538ms | 7.3ms (解码+NMS) | ~24MB |
+| ncnn | yolo26n480 (fp32) | ~7790ms | 7.6ms | ~39MB |
+
+- ncnn int8 较其 fp32 提速 ~3.1x; 检测精度损失可忽略 (int8 漏检 1 个
+  conf=0.51 的弱目标, 其余框/分数与 fp32 基本一致)。
+- ncnn 运行时明显更轻 (模型加载后 24MB vs 40MB), 对 60MB 内存芯片更友好;
+  端到端总耗时请在目标板上用同一图片实测对比 (`-threads` 建议 1~3)。
+
+### ncnn 构建要点 (scripts/build-ncnn-arm.sh)
+
+- `-mfpu=neon` (非 neon-vfpv4) + `NCNN_RUNTIME_CPU`: ncnn CI 标准 armv7
+  配置; master 在 neon-vfpv4 下编译 gemm int8 内核有 fp16 intrinsics
+  守卫漏洞。VFPv4 (Cortex-A7 支持) 由运行期探测自动启用。
+- `NCNN_OPENMP=OFF NCNN_SIMPLEOMP=ON`: 单文件 OpenMP 实现, 静态链接无
+  libgomp 依赖; 线程数经 `net.opt.num_threads` 设置, **须在加载模型前**
+  (Gemm 层在 load 时冻结该值)。
+- 自定义 Shape 层随脚本注入 (scripts/ncnn-shape-layer/), 供
+  ncnn2table/ncnn2int8 等宿主机工具加载模型使用。
+- 量化校准归一化参数 (mean=0, norm=1/255, pixel=RGB) 必须与 Go 预处理
+  一致; 校准图片用 `bash scripts/convert-ncnn.sh 480 <图片目录>` 指定。
+
+
 
 1. **32 位 onnxruntime 无内存池**: `allocator_utils.cc` 中 `sizeof(void*)==4`
    时整体禁用 CPU arena，张量分配全部走 malloc/free，ORT 侧无可调内存池参数。
@@ -150,4 +196,7 @@ bash scripts/convert-model.sh models/*.onnx     # 注意: 传入所有在用模�
   (默认 `-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard`)。
 - onnxruntime 构建选项: `scripts/build-onnxruntime-arm.sh` 中 cmake 参数
   (`BUILD_TYPE=MinSizeRel` 可切换体积优先)。
-- 链接库: `go-yolo26n/Makefile` 的 `CGO_LDFLAGS`。
+- ncnn 构建选项: `scripts/build-ncnn-arm.sh` 中 cmake 参数
+  (`NCNN_INT8`、线程实现、`ARCH_FLAGS` 等)。
+- ncnn 模型转换/量化: `scripts/convert-ncnn.sh` (分辨率/校准目录参数)。
+- 链接库: `go-yolo26n/Makefile` 与 `go-ncnn-demo/Makefile` 的 `CGO_LDFLAGS`。

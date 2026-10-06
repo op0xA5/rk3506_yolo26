@@ -1,17 +1,23 @@
-# onnxruntime 源码 / 构建产物 / 模型 (体积大, 不入库)
+# onnxruntime 源码 / ncnn 源码 / 构建产物 / 模型 (体积大, 不入库)
 onnxruntime-src/
+ncnn-src/
 build/
 dist/
 models/*.onnx
 models/*.ort
 models/*.config
 models/*.pt
+models/*.ncnn.param
+models/*.ncnn.bin
+models/*.table
+models/*.torchscript
 images/
 tools/protoc-21.12/
 tools/*.zip
 
 # Go 构建产物
 go-yolo26n/yolo26n-demo
+go-ncnn-demo/ncnn-demo
 
 # 编辑器 / 系统
 *.swp
