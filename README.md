@@ -39,6 +39,11 @@ pip3 install --user ninja
 bash scripts/export-model.sh      # 得到 models/yolo26n.onnx
 bash scripts/convert-model.sh     # 得到 models/yolo26n.ort + 算子配置
 
+# 3.1 (可选) INT8 量化 + NMS-free 端到端模型 (用于对比测试)
+bash scripts/export-model.sh int8 # 得到 models/yolo26n_nms_int8.onnx
+bash scripts/convert-model.sh models/yolo26n.onnx models/yolo26n_nms_int8.onnx
+                                  # 合并生成两模型共用的算子配置 (含 QLinear* 量化算子)
+
 # 4. 交叉编译 onnxruntime 静态库 (minimal + 只保留模型用到的算子)
 make onnxruntime                  # 或: bash scripts/build-onnxruntime-arm.sh
 
@@ -60,6 +65,20 @@ bash scripts/build-onnxruntime-arm.sh                # 按新算子清单重新�
 
 注意: 算子裁剪后运行**只支持配置中列出的算子**；
 若需保留全部算子 (直接加载任意 .onnx)，用 `MINIMAL_BUILD=OFF OPS_CONFIG="" bash scripts/build-onnxruntime-arm.sh`。
+
+## INT8 量化 NMS-free 模型 (对比测试)
+
+`yolo26n_nms_int8.ort` 由官方 yolo26n.pt 经 INT8 静态量化 (QDQ/QLinear)
+并烘焙 NMS-free 端到端解码 (TopK) 得到:
+
+- 输出 `[1, 300, 6]` = (x1, y1, x2, y2, score, class)，无需 NMS
+- 模型体积 9.6M -> 3.3M，输入仍为 float32，Go 程序无需修改
+- 导出: `bash scripts/export-model.sh int8`
+  (本质是 `yolo export format=onnx nms=False quantize=int8`，校准数据默认 coco8)
+
+对比运行 (宿主机 qemu 模拟，绝对耗时不代表真实芯片):
+`make -C go-yolo26n compare ARGS="-iters 10"`
+目标板上分别用 `-model yolo26n.ort` 与 `-model yolo26n_nms_int8.ort` 运行即可对比。
 
 ## 程序说明
 

@@ -28,7 +28,7 @@ export CGO_CFLAGS  = -I$(abspath $(DIST)/include)
 export CGO_LDFLAGS = -Wl,--start-group $(abspath $(ORT_LIBS)) -Wl,--end-group -lstdc++ -ldl -lpthread -lm
 export CGO_LDFLAGS_ALLOW = -Wl,.*
 
-.PHONY: all run clean check
+.PHONY: all run compare clean check
 
 all: $(TARGET)
 
@@ -40,6 +40,17 @@ check:
 
 run: $(TARGET)
 	qemu-arm -L $(SDK)/arm-buildroot-linux-gnueabihf/sysroot ./$(TARGET) $(ARGS)
+
+# 对比测试: 依次运行 fp32 与 int8(NMS-free end2end) 两个模型
+# 注意: qemu 为指令模拟, 绝对耗时不代表真实芯片, 真实对比请在目标板上运行
+compare: $(TARGET)
+	@echo "================= FP32: yolo26n.ort ================="
+	qemu-arm -L $(SDK)/arm-buildroot-linux-gnueabihf/sysroot ./$(TARGET) \
+	  -model ../models/yolo26n.ort -image ../images/bus.jpg $(ARGS)
+	@echo ""
+	@echo "========= INT8 end2end: yolo26n_nms_int8.ort ========="
+	qemu-arm -L $(SDK)/arm-buildroot-linux-gnueabihf/sysroot ./$(TARGET) \
+	  -model ../models/yolo26n_nms_int8.ort -image ../images/bus.jpg $(ARGS)
 
 clean:
 	rm -f $(TARGET)

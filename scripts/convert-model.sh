@@ -23,6 +23,10 @@ if [ ${#MODELS[@]} -eq 0 ]; then
   MODELS=("$ROOT_DIR"/models/*.onnx)
   [ ${#MODELS[@]} -gt 0 ] || { echo "models/ 下没有 .onnx 模型，请先导出或指定路径"; exit 1; }
 fi
+# 转为绝对路径 (后续会 cd 到 ORT 工具目录执行)
+for i in "${!MODELS[@]}"; do
+  MODELS[$i]="$(readlink -f "${MODELS[$i]}")"
+done
 
 # 1) 转换为 .ort (Fixed: 转换期固定图, 运行时不依赖优化器; 同时输出算子配置)
 for m in "${MODELS[@]}"; do
