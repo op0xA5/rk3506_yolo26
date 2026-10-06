@@ -2,6 +2,7 @@
 #include "wrapper.h"
 #include "net.h"
 #include "mat.h"
+#include <vector>
 
 struct ncnn_handle
 {
@@ -50,26 +51,15 @@ int ncnn_run(ncnn_handle_t* h, int threads)
 {
     h->net.opt.num_threads = threads;
     ncnn::Extractor ex = h->net.create_extractor();
-    // 输入/输出 blob 名候选: onnx2ncnn 用 images/output0, pnnx 用 in0/out0
-    static const char* INPUT_CANDIDATES[] = {"images", "in0", "input", "x"};
-    static const char* OUTPUT_CANDIDATES[] = {"output0", "out0", "output", "y"};
-    int rc = -2;
-    for (size_t i = 0; i < sizeof(INPUT_CANDIDATES) / sizeof(*INPUT_CANDIDATES); i++)
-    {
-        rc = ex.input(INPUT_CANDIDATES[i], h->in);
-        if (rc == 0)
-            break;
-    }
-    if (rc != 0)
+    // 用 net.input_names()/output_names() 取真实 blob 名 (onnx2ncnn 为
+    // images/output0, pnnx 为 in0/out0), 避免按候选名探测产生的失败日志。
+    const std::vector<const char*>& in_names = h->net.input_names();
+    const std::vector<const char*>& out_names = h->net.output_names();
+    if (in_names.empty() || out_names.empty())
         return -2;
-    rc = -3;
-    for (size_t i = 0; i < sizeof(OUTPUT_CANDIDATES) / sizeof(*OUTPUT_CANDIDATES); i++)
-    {
-        rc = ex.extract(OUTPUT_CANDIDATES[i], h->out);
-        if (rc == 0)
-            break;
-    }
-    if (rc != 0)
+    if (ex.input(in_names[0], h->in) != 0)
+        return -2;
+    if (ex.extract(out_names[0], h->out) != 0)
         return -3;
     return 0;
 }
