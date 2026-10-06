@@ -80,8 +80,22 @@ bash scripts/build-onnxruntime-arm.sh                # 按新算子清单重新�
   建议设 `CALIB_DIR=自己的图片目录` 或用 `python3 scripts/quantize-int8.py --calib-dir DIR`)
 
 对比运行 (宿主机 qemu 模拟，绝对耗时不代表真实芯片):
-`make -C go-yolo26n compare ARGS="-iters 10"`
+`make -C go-yolo26n compare ARGS="-iters 10"` (fp32-640 vs int8-640)
+`make -C go-yolo26n compare480 ARGS="-iters 10"` (int8-480 端到端 vs int8-480 原始输出+Go NMS)
 目标板上分别用 `-model yolo26n.ort` 与 `-model yolo26n_nms_int8.ort` 运行即可对比。
+
+### 端到端 vs Go NMS 后处理对比 (int8-480, qemu)
+
+| 模型 | 输出 | 推理 | 后处理 |
+|---|---|---|---|
+| yolo26n480_nms_int8.ort | [1,300,6] TopK 已烘焙 | ~2500ms | ~0.3ms |
+| yolo26n480_int8.ort | [1,84,4725] 原始输出 | ~2530ms | ~8.4ms (解码+NMS) |
+
+端到端模型把 TopK/NMS 烘焙进图 (CPU 上几乎零开销)，Go 侧只做阈值过滤;
+原始输出模型推理相同, 但 Go 需解码 4725 个候选框并做 NMS, 后处理差 ~28x。
+生成原始输出 480 int8: `IMGSZ=480 bash scripts/export-model.sh` 后
+`python3 scripts/quantize-int8.py models/yolo26n480_raw_fp32.onnx models/yolo26n480_int8.onnx --size 480`
+再 `bash scripts/convert-model.sh models/*.onnx` (注意: 转换时需带上所有在用的模型, 配置为合并生成)。
 
 ## 内存说明 (目标芯片可用内存 ~60MB)
 
