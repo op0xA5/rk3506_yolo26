@@ -28,7 +28,7 @@ export CGO_CFLAGS  = -I$(abspath $(DIST)/include)
 export CGO_LDFLAGS = -Wl,--start-group $(abspath $(ORT_LIBS)) -Wl,--end-group -lstdc++ -ldl -lpthread -lm
 export CGO_LDFLAGS_ALLOW = -Wl,.*
 
-.PHONY: all run compare compare480 clean check
+.PHONY: all run compare compare480 compare320 clean check
 
 all: $(TARGET)
 
@@ -61,6 +61,16 @@ compare480: $(TARGET)
 	@echo "======== INT8 480 raw+GoNMS: yolo26n480_int8.ort ========="
 	qemu-arm -L $(SDK)/arm-buildroot-linux-gnueabihf/sysroot ./$(TARGET) \
 	  -model ../models/yolo26n480_int8.ort -image ../images/bus.jpg $(ARGS)
+
+# 320 分辨率对比: int8 端到端 vs int8 原始输出 (Go NMS)
+compare320: $(TARGET)
+	@echo "======== INT8 320 end2end: yolo26n320_nms_int8.ort ========"
+	qemu-arm -L $(SDK)/arm-buildroot-linux-gnueabihf/sysroot ./$(TARGET) \
+	  -model ../models/yolo26n320_nms_int8.ort -image ../images/bus.jpg $(ARGS)
+	@echo ""
+	@echo "======== INT8 320 raw+GoNMS: yolo26n320_int8.ort ========="
+	qemu-arm -L $(SDK)/arm-buildroot-linux-gnueabihf/sysroot ./$(TARGET) \
+	  -model ../models/yolo26n320_int8.ort -image ../images/bus.jpg $(ARGS)
 
 clean:
 	rm -f $(TARGET)

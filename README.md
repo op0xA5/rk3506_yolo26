@@ -84,18 +84,29 @@ bash scripts/build-onnxruntime-arm.sh                # 按新算子清单重新�
 `make -C go-yolo26n compare480 ARGS="-iters 10"` (int8-480 端到端 vs int8-480 原始输出+Go NMS)
 目标板上分别用 `-model yolo26n.ort` 与 `-model yolo26n_nms_int8.ort` 运行即可对比。
 
-### 端到端 vs Go NMS 后处理对比 (int8-480, qemu)
+### 端到端 vs Go NMS 后处理对比 (int8, qemu, threads=2)
 
-| 模型 | 输出 | 推理 | 后处理 |
-|---|---|---|---|
-| yolo26n480_nms_int8.ort | [1,300,6] TopK 已烘焙 | ~2500ms | ~0.3ms |
-| yolo26n480_int8.ort | [1,84,4725] 原始输出 | ~2530ms | ~8.4ms (解码+NMS) |
+| 分辨率 | 模型 | 输出 | 推理 | 后处理 |
+|---|---|---|---|---|
+| 640 | yolo26n_nms_int8.ort (e2e) | [1,300,6] | ~4200ms | ~0.3ms |
+| 480 | yolo26n480_nms_int8.ort (e2e) | [1,300,6] | ~2460ms | ~0.3ms |
+| 480 | yolo26n480_int8.ort (raw) | [1,84,4725] | ~2430ms | ~8.4ms |
+| 320 | yolo26n320_nms_int8.ort (e2e) | [1,300,6] | ~1170ms | ~3.0ms |
+| 320 | yolo26n320_int8.ort (raw) | [1,84,2100] | ~1170ms | ~4.4ms |
 
-端到端模型把 TopK/NMS 烘焙进图 (CPU 上几乎零开销)，Go 侧只做阈值过滤;
-原始输出模型推理相同, 但 Go 需解码 4725 个候选框并做 NMS, 后处理差 ~28x。
-生成原始输出 480 int8: `IMGSZ=480 bash scripts/export-model.sh` 后
-`python3 scripts/quantize-int8.py models/yolo26n480_raw_fp32.onnx models/yolo26n480_int8.onnx --size 480`
-再 `bash scripts/convert-model.sh models/*.onnx` (注意: 转换时需带上所有在用的模型, 配置为合并生成)。
+推理耗时与分辨率近似平方关系 (640->320 快 ~3.6x); 原始输出模型的
+Go NMS 后处理随候选框数线性增长 (2100->4725: 4.4ms->8.4ms)。
+`make -C go-yolo26n compare480 / compare320` 可分别复现。
+内存峰值 (推理后 VmRSS): 320 ~53MB, 480 ~55MB, 640 ~59MB。
+
+生成方法 (以 320 为例, 480/640 同理改 IMGSZ):
+```bash
+IMGSZ=320 bash scripts/export-model.sh          # 原始输出 fp32 -> yolo26n320_raw_fp32.onnx (需改名保存)
+IMGSZ=320 bash scripts/export-model.sh e2e      # 端到端 fp32 -> yolo26n320_e2e_fp32.onnx
+python3 scripts/quantize-int8.py models/yolo26n320_e2e_fp32.onnx models/yolo26n320_nms_int8.onnx --size 320
+python3 scripts/quantize-int8.py models/yolo26n320_raw_fp32.onnx models/yolo26n320_int8.onnx --size 320
+bash scripts/convert-model.sh models/*.onnx     # 注意: 传入所有在用模型, 配置为合并生成
+```
 
 ## 内存说明 (目标芯片可用内存 ~60MB)
 
