@@ -12,8 +12,26 @@ import (
 	"image/jpeg"
 	"image/png"
 	"os"
+	"runtime/debug"
+	"strconv"
+	"strings"
 	"time"
 )
+
+// vmRSS 读取 /proc/self/statm 的第 2 个字段 (常驻页数)*页size, 用于内存分析。
+func vmRSS() int {
+	b, err := os.ReadFile("/proc/self/statm")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "[内存] 读取 /proc/self/statm 失败:", err)
+		return -1
+	}
+	f := strings.Fields(string(b))
+	if len(f) < 2 {
+		return -1
+	}
+	pages, _ := strconv.ParseInt(f[1], 10, 64)
+	return int(pages * 4096 / 1024)
+}
 
 func ms(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
 
@@ -24,11 +42,18 @@ func main() {
 		outPath   = flag.String("out", "", "标注结果输出图片路径 (默认: 不保存)")
 		conf      = flag.Float64("conf", 0.25, "置信度阈值")
 		iters     = flag.Int("iters", 10, "推理重复次数 (取统计值)")
-		threads   = flag.Int("threads", 4, "onnxruntime intra-op 线程数")
+		threads   = flag.Int("threads", 2, "onnxruntime intra-op 线程数")
 		nmsFlag   = flag.Bool("nms", true, "对原始输出格式 [1,4+C,N] 做 NMS (端到端 [1,N,6] 输出不受影响)")
 		numCls    = flag.Int("classes", 80, "类别数 (COCO=80)")
+		memLimit  = flag.Int("memlimit", 16, "Go 堆内存软上限 (MB, 供 GC 参考; 0 不限制)")
 	)
 	flag.Parse()
+
+	// Go 堆内存控制: 内存受限芯片上压低 GC 阈值, 避免 Go 堆无节制增长
+	if *memLimit > 0 {
+		debug.SetMemoryLimit(int64(*memLimit) << 20)
+		debug.SetGCPercent(50)
+	}
 
 	// ---------- 1. 模型加载 ----------
 	t0 := time.Now()
@@ -45,9 +70,11 @@ func main() {
 	}
 	inH, inW := int(ort.InputShape[2]), int(ort.InputShape[3])
 	fmt.Printf("模型: %s\n", *model)
-	fmt.Printf("输入: %s  [%d x %d], intra-op threads = %d\n\n", shapeStr(ort.InputShape), inW, inH, *threads)
+	fmt.Printf("输入: %s  [%d x %d], intra-op threads = %d\n",
+		shapeStr(ort.InputShape), inW, inH, *threads)
+	fmt.Printf("[内存] 模型加载后 VmRSS = %d KB\n\n", vmRSS())
 
-	// ---------- 2. 图片解码 + 预处理 ----------
+	// ---------- 2. 图片解码 + 预处理 (写入复用的输入缓冲, 零分配) ----------
 	t0 = time.Now()
 	img, err := decodeImage(*imagePath)
 	if err != nil {
@@ -57,20 +84,21 @@ func main() {
 	decodeDur := time.Since(t0)
 
 	t0 = time.Now()
-	input, meta := letterboxPreprocess(img, inW, inH)
+	input := ort.Input() // 复用缓冲: 预处理后直接推理, 无拷贝
+	meta := letterboxPreprocess(img, inW, inH, input, nil)
 	preprocessDur := time.Since(t0)
 
-	// ---------- 3. 推理 (含 warmup) ----------
-	var raw []float32
-	var outShape []int64
-	if raw, outShape, err = ort.Run(input); err != nil { // warmup: 线程池初始化/缓存预热
+	// ---------- 3. 推理 (含 warmup; 输入/输出均零拷贝, 重复轮次零分配) ----------
+	out, err := ort.Run() // warmup: 线程池初始化/缓存预热
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "warmup 推理失败:", err)
 		os.Exit(1)
 	}
 	var total, min, max time.Duration
 	for i := 0; i < *iters; i++ {
+		out.Close()
 		t0 = time.Now()
-		if raw, outShape, err = ort.Run(input); err != nil {
+		if out, err = ort.Run(); err != nil {
 			fmt.Fprintln(os.Stderr, "推理失败:", err)
 			os.Exit(1)
 		}
@@ -84,10 +112,13 @@ func main() {
 		}
 	}
 	inferAvg := total / time.Duration(*iters)
+	fmt.Printf("[内存] 推理结束后 VmRSS = %d KB\n", vmRSS())
 
-	// ---------- 4. 后处理 (使用最后一轮推理输出) ----------
+	// ---------- 4. 后处理 (直接消费零拷贝输出, 立即释放) ----------
 	t0 = time.Now()
-	dets := postprocess(raw, outShape, meta, *conf, *numCls, *nmsFlag)
+	dets := postprocess(out.Data, out.Shape, meta, *conf, *numCls, *nmsFlag)
+	outShape := out.Shape
+	out.Close()
 	postprocessDur := time.Since(t0)
 
 	// ---------- 5. 结果输出 ----------

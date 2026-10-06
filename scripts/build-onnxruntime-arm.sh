@@ -61,6 +61,7 @@ if [ "${SKIP_CONFIGURE:-0}" != "1" ]; then
     -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
     -DONNX_CUSTOM_PROTOC_EXECUTABLE="$PROTOC" \
     -Donnxruntime_MINIMAL_BUILD="$MINIMAL_BUILD" \
+    -Donnxruntime_DISABLE_CONTRIB_OPS=OFF \
     -Donnxruntime_DISABLE_EXCEPTIONS=OFF \
     -Donnxruntime_CROSS_COMPILING=ON \
     -Donnxruntime_BUILD_SHARED_LIB=OFF \

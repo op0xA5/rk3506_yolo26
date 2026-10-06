@@ -37,9 +37,11 @@ for m in "${MODELS[@]}"; do
       "$m")
 done
 
-# 2) 汇总算子配置到 models/ 顶层，供交叉编译脚本使用
-#    convert 脚本为每个模型生成 *.required_operators.config，
-#    多个模型时合并去重。
+# 2) 汇总算子配置到 models/ 顶层，供交叉编译脚本使用。
+#    合并两个来源 (互补, 均为 "domain;opset;Op,Op,..." 格式):
+#    a) convert 脚本生成的 *.required_operators.config (覆盖 .ort 转换期优化新增的算子)
+#    b) 直接扫描 .onnx 图的算子及 domain (修正转换脚本对 QLinearConv 等
+#       ai.onnx 域算子的误归类, 如 QLinearConv/QLinearMatMul 实际注册在 ai.onnx;10)
 OUT_CFG="$ROOT_DIR/models/required_operators.config"
 : > "$OUT_CFG"
 for c in "${MODELS[@]}"; do
@@ -47,7 +49,46 @@ for c in "${MODELS[@]}"; do
   [ -f "$cfg" ] || { echo "缺少算子配置: $cfg"; exit 1; }
   grep -v '^#' "$cfg" >> "$OUT_CFG"
 done
-sort -u "$OUT_CFG" -o "$OUT_CFG"
+python3 - "$OUT_CFG" "${MODELS[@]}" <<'EOF'
+import sys
+import onnx
+
+out, models = sys.argv[1], sys.argv[2:]
+lines = set()
+for m in models:
+    mo = onnx.load(m, load_external_data=False)
+    opsets = {("ai.onnx" if o.domain == "" else o.domain): o.version for o in mo.opset_import}
+    def walk(g):
+        for n in g.node:
+            dom = n.domain if n.domain else "ai.onnx"
+            lines.add(f"{dom};{opsets.get(dom, 1)};{n.op_type}")
+            for a in n.attribute:
+                if a.type == onnx.AttributeProto.GRAPH:
+                    walk(a.g)
+                elif a.type == onnx.AttributeProto.GRAPHS:
+                    for sg in a.graphs:
+                        walk(sg)
+    walk(mo.graph)
+with open(out, "a") as f:
+    for l in sorted(lines):
+        f.write(l + "\n")
+EOF
+# 归并同一 domain+opset 的行, 去重算子
+python3 - "$OUT_CFG" <<'EOF'
+import sys
+from collections import defaultdict
+
+ops = defaultdict(set)
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if not line or line.startswith("#"):
+        continue
+    dom, ver, names = line.split(";", 2)
+    ops[(dom, ver)].update(n for n in names.split(",") if n)
+with open(sys.argv[1], "w") as f:
+    for (dom, ver) in sorted(ops):
+        f.write(f"{dom};{ver};{','.join(sorted(ops[(dom, ver)]))}\n")
+EOF
 
 echo ""
 echo "==> 生成的文件:"

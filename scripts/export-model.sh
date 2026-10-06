@@ -3,13 +3,14 @@
 #
 # 用法:
 #   bash scripts/export-model.sh          # fp32 原始模型 -> yolo26n.onnx
-#   bash scripts/export-model.sh int8     # INT8 量化 + NMS-free 端到端 -> yolo26n_nms_int8.onnx
+#   bash scripts/export-model.sh e2e      # fp32 NMS-free 端到端 -> yolo26n_e2e_fp32.onnx
+#   bash scripts/export-model.sh int8     # INT8(QOperator) + NMS-free 端到端 -> yolo26n_nms_int8.onnx
 #
-# int8 导出 (本质是): yolo export model=yolo26n.pt format=onnx nms=False quantize=int8
-#   - nms=False 触发 end2end 分支 (TopK 烘焙进图, 输出 [1,300,6], 无需运行期 NMS)
-#   - quantize=int8 使用 onnxruntime 静态量化 (校准数据默认 coco8.yaml, 自动下载)
-#
-# 若本机无法安装 ultralytics，可在任意 x86 电脑上导出后拷贝 models/*.onnx 到本目录。
+# int8 流程: 先用 e2e 导出 fp32 端到端模型, 再运行 scripts/quantize-int8.py
+# 做 QOperator 静态量化 (激活张量全程 int8, 内存约为 QDQ 格式的 1/4,
+# 适合 60MB 级内存芯片; ultralytics 自带的 quantize=int8 为 QDQ 格式,
+# 反量化后激活仍为 fp32, 低内存设备上更耗内存, 故不使用)。
+# 校准数据默认 ultralytics coco8; 建议用 --calib-dir 指定与部署场景一致的数据。
 set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -19,16 +20,27 @@ if ! python3 -c "import ultralytics" 2>/dev/null; then
 fi
 
 cd "$ROOT_DIR/models"
-if [ "${1:-}" = "int8" ]; then
-  python3 -c "
+IMGSZ="${IMGSZ:-640}"
+case "${1:-}" in
+  e2e)
+    python3 -c "
 from ultralytics import YOLO
-YOLO('yolo26n.pt').export(format='onnx', imgsz=640, nms=False, quantize='int8', data='coco8.yaml')
+YOLO('yolo26n.pt').export(format='onnx', imgsz=$IMGSZ, nms=False)
 "
-  echo "已导出: $ROOT_DIR/models/yolo26n_nms_int8.onnx"
-else
-  python3 -c "
+    cp -f yolo26n.onnx yolo26n_e2e_fp32.onnx
+    echo "已导出: $ROOT_DIR/models/yolo26n_e2e_fp32.onnx"
+    ;;
+  int8)
+    bash "$ROOT_DIR/scripts/export-model.sh" e2e
+    python3 "$ROOT_DIR/scripts/quantize-int8.py" \
+      "$ROOT_DIR/models/yolo26n_e2e_fp32.onnx" "$ROOT_DIR/models/yolo26n_nms_int8.onnx" \
+      --size "$IMGSZ" ${CALIB_DIR:+--calib-dir "$CALIB_DIR"}
+    ;;
+  *)
+    python3 -c "
 from ultralytics import YOLO
 YOLO('yolo26n.pt').export(format='onnx', imgsz=640)
 "
-  echo "已导出: $ROOT_DIR/models/yolo26n.onnx"
-fi
+    echo "已导出: $ROOT_DIR/models/yolo26n.onnx"
+    ;;
+esac

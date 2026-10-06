@@ -32,9 +32,11 @@ func decodeImage(path string) (image.Image, error) {
 }
 
 // letterboxPreprocess 将图片等比缩放并居中填充到 inW x inH，
-// 转换为 NCHW float32，像素归一化到 [0,1]，RGB 通道顺序。
+// 转换为 NCHW float32 写入 dst (长度须为 3*inH*inW)，像素归一化到 [0,1]，RGB 通道顺序。
+// tmp 为内部复用的缩放中间缓冲 (长度至少 3*inH*inW, 可为 nil 则内部分配一次)。
 // 与 Ultralytics 默认预处理保持一致 (scaleup=false, fill=114)。
-func letterboxPreprocess(img image.Image, inW, inH int) ([]float32, letterboxMeta) {
+// 全程不分配内存 (复用 dst/tmp), 以便在内存受限芯片上运行。
+func letterboxPreprocess(img image.Image, inW, inH int, dst []float32, tmp []uint8) letterboxMeta {
 	b := img.Bounds()
 	srcW, srcH := b.Dx(), b.Dy()
 
@@ -47,35 +49,39 @@ func letterboxPreprocess(img image.Image, inW, inH int) ([]float32, letterboxMet
 	padX := float64(inW-newW) / 2
 	padY := float64(inH-newH) / 2
 
+	if cap(tmp) < 3*newW*newH {
+		tmp = make([]uint8, 3*newW*newH)
+	} else {
+		tmp = tmp[:3*newW*newH]
+	}
 	// 先等比缩放到 (newW, newH)
-	resized := resizeBilinear(img, newW, newH)
+	resizeBilinearInto(img, newW, newH, tmp)
 
 	// 填充 + 归一化 + HWC->CHW + RGB
-	input := make([]float32, 3*inH*inW)
 	for y := 0; y < inH; y++ {
 		sy := y - int(padY)
 		for x := 0; x < inW; x++ {
 			sx := x - int(padX)
 			r, g, bch := uint8(114), uint8(114), uint8(114)
 			if sx >= 0 && sx < newW && sy >= 0 && sy < newH {
-				c := resized[3*(sy*newW+sx):]
+				c := tmp[3*(sy*newW+sx):]
 				r, g, bch = c[0], c[1], c[2]
 			}
 			// RGB -> 归一化, 按 CHW 布局
-			input[0*inH*inW+y*inW+x] = float32(r) / 255
-			input[1*inH*inW+y*inW+x] = float32(g) / 255
-			input[2*inH*inW+y*inW+x] = float32(bch) / 255
+			dst[0*inH*inW+y*inW+x] = float32(r) / 255
+			dst[1*inH*inW+y*inW+x] = float32(g) / 255
+			dst[2*inH*inW+y*inW+x] = float32(bch) / 255
 		}
 	}
-	return input, letterboxMeta{scale: scale, padX: padX, padY: padY,
+	return letterboxMeta{scale: scale, padX: padX, padY: padY,
 		inW: inW, inH: inH, srcW: srcW, srcH: srcH}
 }
 
-// resizeBilinear 双线性缩放，返回 HWC RGB 字节数组（避免引入 image/draw 重采样依赖）。
-func resizeBilinear(img image.Image, dstW, dstH int) []uint8 {
+// resizeBilinearInto 双线性缩放，结果写入 out (HWC RGB, 3*dstH*dstW 字节)。
+// 直接逐点采样原图，无额外中间分配。
+func resizeBilinearInto(img image.Image, dstW, dstH int, out []uint8) {
 	b := img.Bounds()
 	srcW, srcH := b.Dx(), b.Dy()
-	out := make([]uint8, dstW*dstH*3)
 
 	// 中心对齐的采样坐标
 	for dy := 0; dy < dstH; dy++ {
@@ -117,7 +123,6 @@ func resizeBilinear(img image.Image, dstW, dstH int) []uint8 {
 			out[i+2] = uint8((w00*float64(b00>>8) + w10*float64(b10>>8) + w01*float64(b01>>8) + w11*float64(b11>>8)) + 0.5)
 		}
 	}
-	return out
 }
 
 // mapToSource 将 letterbox 坐标系下的坐标映射回原图坐标 (并钳制到图像范围内)。

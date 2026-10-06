@@ -1,12 +1,22 @@
 // ort.go - onnxruntime C API 的 cgo 封装 (静态库链接)。
 //
+// 内存说明 (目标芯片可用内存 ~60MB):
+//   - 输入 OrtValue 只创建一次并复用 (CreateTensorWithDataAsOrtValue 零拷贝包装,
+//     ORT 仅在 Run 期间读取输入, 复用安全), 避免每轮推理重复创建。
+//   - 输出零拷贝: Run 直接暴露 OrtValue 底层内存的切片视图, 后处理就地消费,
+//     避免 84*8400*4 ~= 2.8MB 的每轮拷贝与 GC 压力, Close 时才释放。
+//   - 注意: onnxruntime 在 32 位构建上禁用 CPU 内存池 (allocator_utils.cc:
+//     sizeof(void*)==4 时 arena 关闭), ARM32 上所有张量分配走 malloc/free,
+//     不存在可收缩/可配置的 arena; 降低峰值内存的主要手段是零拷贝/缓冲复用
+//     以及使用 INT8 模型 (激活张量约为 fp32 的 1/4)。
+//
 // 注意: cgo 无法直接索引 OrtApi 结构体的函数指针成员，
 // 因此所有 API 调用都在下方的 C 包装函数中完成。
 //
 // 编译时通过 Makefile 注入:
 //
 //	CGO_CFLAGS  = -I$(dist/armv7l/include)
-//	CGO_LDFLAGS = -Wl,--start-group $(dist/armv7l/lib/*.a) -Wl,--end-group -ldl -lpthread -lm
+//	CGO_LDFLAGS = -Wl,--start-group $(dist/armv7l/lib/*.a) -Wl,--end-group -lstdc++ -ldl -lpthread -lm
 package main
 
 /*
@@ -88,10 +98,17 @@ static OrtStatus* w_create_tensor(OrtApi* a, OrtMemoryInfo* m, void* data, size_
 	return a->CreateTensorWithDataAsOrtValue(m, data, bytes, shape, ndims,
 	                                         ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, v);
 }
-static OrtStatus* w_run(OrtApi* a, OrtSession* s, const char* in_name, OrtValue* in,
+
+// 注意: onnxruntime 在 32 位构建上整体禁用 CPU 内存池
+// (onnxruntime/core/framework/allocator_utils.cc: sizeof(void*)==4 -> arena 关闭,
+// 防止整数溢出死循环), ARM32 上所有张量分配直接走 malloc/free,
+// 因此不存在可收缩的 arena; 内存优化只能靠零拷贝/缓冲复用 (见文件头注释)。
+
+static OrtStatus* w_run(OrtApi* a, OrtSession* s, OrtRunOptions* ro,
+                        const char* in_name, OrtValue* in,
                         const char* out_name, OrtValue** out) {
 	const OrtValue* in_ptr = in;
-	return a->Run(s, NULL, &in_name, &in_ptr, 1, &out_name, 1, out);
+	return a->Run(s, ro, &in_name, &in_ptr, 1, &out_name, 1, out);
 }
 static OrtStatus* w_tensor_type_and_shape(OrtApi* a, OrtValue* v, OrtTensorTypeAndShapeInfo** t) {
 	return a->GetTensorTypeAndShape(v, t);
@@ -108,7 +125,7 @@ import (
 	"unsafe"
 )
 
-// Ort 封装 onnxruntime 运行时会话。
+// Ort 封装 onnxruntime 运行时会话 (输入/输出零拷贝, 缓冲复用)。
 type Ort struct {
 	api        *C.OrtApi
 	env        *C.OrtEnv
@@ -116,6 +133,9 @@ type Ort struct {
 	memInfo    *C.OrtMemoryInfo
 	inputName  *C.char // 由 ORT allocator 分配
 	outputName *C.char
+
+	inputValue *C.OrtValue // 复用的输入 tensor (包装 inputBuf 内存)
+	inputBuf   []float32   // 复用的 NCHW 输入缓冲 (外部须写入此切片)
 
 	InputShape []int64 // NCHW, 例如 [1,3,640,640]
 }
@@ -126,12 +146,8 @@ func (o *Ort) statusErr(st *C.OrtStatus) error {
 		return nil
 	}
 	msg := C.GoString(C.w_status_message(o.api, st))
-	o.api_release_status(st)
-	return errors.New(msg)
-}
-
-func (o *Ort) api_release_status(st *C.OrtStatus) {
 	C.w_release_status(o.api, st)
+	return errors.New(msg)
 }
 
 // NewOrt 加载模型并创建会话。threads 为 intra-op 线程数。
@@ -144,6 +160,10 @@ func NewOrt(modelPath string, threads int) (*Ort, error) {
 
 	if err := o.statusErr(C.w_create_env(api, &o.env)); err != nil {
 		return nil, fmt.Errorf("CreateEnv: %w", err)
+	}
+
+	if err := o.statusErr(C.w_create_cpu_meminfo(api, &o.memInfo)); err != nil {
+		return nil, fmt.Errorf("CreateCpuMemoryInfo: %w", err)
 	}
 
 	var opts *C.OrtSessionOptions
@@ -166,10 +186,6 @@ func NewOrt(modelPath string, threads int) (*Ort, error) {
 	defer C.free(unsafe.Pointer(cpath))
 	if err := o.statusErr(C.w_create_session(api, o.env, cpath, opts, &o.session)); err != nil {
 		return nil, fmt.Errorf("CreateSession(%s): %w", modelPath, err)
-	}
-
-	if err := o.statusErr(C.w_create_cpu_meminfo(api, &o.memInfo)); err != nil {
-		return nil, fmt.Errorf("CreateCpuMemoryInfo: %w", err)
 	}
 
 	var alloc *C.OrtAllocator
@@ -213,11 +229,47 @@ func NewOrt(modelPath string, threads int) (*Ort, error) {
 	if count != 1 {
 		return nil, fmt.Errorf("期望单输出模型，实际输出数 %d", int(count))
 	}
+
+	// 预分配输入缓冲并一次性创建输入 OrtValue (后续 Run 复用, 零分配)
+	numel := 1
+	for _, d := range o.InputShape {
+		numel *= int(d)
+	}
+	o.inputBuf = make([]float32, numel)
+	if err := o.statusErr(C.w_create_tensor(api, o.memInfo,
+		unsafe.Pointer(&o.inputBuf[0]), C.size_t(numel*4),
+		(*C.int64_t)(unsafe.Pointer(&o.InputShape[0])), C.size_t(len(o.InputShape)),
+		&o.inputValue)); err != nil {
+		return nil, fmt.Errorf("CreateTensor(input): %w", err)
+	}
 	return o, nil
+}
+
+// Input 返回可复用的 NCHW 输入缓冲；预处理后直接调用 Run，无需任何拷贝。
+func (o *Ort) Input() []float32 { return o.inputBuf }
+
+// Output 推理输出的零拷贝视图，Close 后 Data 失效。
+type Output struct {
+	Data  []float32 // 直接映射 OrtValue 底层内存, 禁止越界写
+	Shape []int64
+	value *C.OrtValue
+	ort   *Ort
+}
+
+// Close 释放输出 tensor (调用后 Data 不可再访问)。
+func (out *Output) Close() {
+	if out.value != nil {
+		C.w_release_value(out.ort.api, out.value)
+		out.value = nil
+		out.Data = nil
+	}
 }
 
 // Close 释放会话资源。
 func (o *Ort) Close() {
+	if o.inputValue != nil {
+		C.w_release_value(o.api, o.inputValue)
+	}
 	if o.session != nil {
 		C.w_release_session(o.api, o.session)
 	}
@@ -229,60 +281,50 @@ func (o *Ort) Close() {
 	}
 }
 
-// Run 执行推理：input 为 NCHW float32 数据（长度须等于 InputShape 各维乘积）。
-// 返回输出 tensor 的数据副本与形状。
-func (o *Ort) Run(input []float32) ([]float32, []int64, error) {
-	numel := 1
-	for _, d := range o.InputShape {
-		numel *= int(d)
-	}
-	if len(input) != numel {
-		return nil, nil, fmt.Errorf("输入长度 %d 与模型形状 %v 不匹配", len(input), o.InputShape)
-	}
-
-	var inputTensor *C.OrtValue
-	err := o.statusErr(C.w_create_tensor(o.api, o.memInfo,
-		unsafe.Pointer(&input[0]), C.size_t(len(input)*4),
-		(*C.int64_t)(unsafe.Pointer(&o.InputShape[0])), C.size_t(len(o.InputShape)),
-		&inputTensor))
-	if err != nil {
-		return nil, nil, fmt.Errorf("CreateTensor(input): %w", err)
-	}
-	defer C.w_release_value(o.api, inputTensor)
-
+// Run 执行推理。输入须已写入 Input() 返回的缓冲。
+// 返回零拷贝输出视图 (调用方负责 Close, 建议立即消费)。
+func (o *Ort) Run() (*Output, error) {
 	var outputTensor *C.OrtValue
-	err = o.statusErr(C.w_run(o.api, o.session, o.inputName, inputTensor, o.outputName, &outputTensor))
+	err := o.statusErr(C.w_run(o.api, o.session, nil, o.inputName, o.inputValue, o.outputName, &outputTensor))
 	if err != nil {
-		return nil, nil, fmt.Errorf("SessionRun: %w", err)
+		return nil, fmt.Errorf("SessionRun: %w", err)
 	}
-	defer C.w_release_value(o.api, outputTensor)
 
 	var outInfo *C.OrtTensorTypeAndShapeInfo
 	if err := o.statusErr(C.w_tensor_type_and_shape(o.api, outputTensor, &outInfo)); err != nil {
-		return nil, nil, err
+		C.w_release_value(o.api, outputTensor)
+		return nil, err
 	}
-	defer C.w_release_tensor_shape(o.api, outInfo)
-
 	var ndims C.size_t
 	if err := o.statusErr(C.w_dims_count(o.api, outInfo, &ndims)); err != nil {
-		return nil, nil, err
+		C.w_release_tensor_shape(o.api, outInfo)
+		C.w_release_value(o.api, outputTensor)
+		return nil, err
 	}
 	dims := make([]C.int64_t, ndims)
 	if err := o.statusErr(C.w_dims(o.api, outInfo, &dims[0], ndims)); err != nil {
-		return nil, nil, err
+		C.w_release_tensor_shape(o.api, outInfo)
+		C.w_release_value(o.api, outputTensor)
+		return nil, err
 	}
+	C.w_release_tensor_shape(o.api, outInfo)
+
 	shape := make([]int64, ndims)
-	outNumel := 1
+	numel := 1
 	for i := range dims {
 		shape[i] = int64(dims[i])
-		outNumel *= int(shape[i])
+		numel *= int(shape[i])
 	}
 
-	var outData unsafe.Pointer
-	if err := o.statusErr(C.w_tensor_mutable_data(o.api, outputTensor, &outData)); err != nil {
-		return nil, nil, err
+	var data unsafe.Pointer
+	if err := o.statusErr(C.w_tensor_mutable_data(o.api, outputTensor, &data)); err != nil {
+		C.w_release_value(o.api, outputTensor)
+		return nil, err
 	}
-	out := make([]float32, outNumel)
-	copy(out, unsafe.Slice((*float32)(outData), outNumel))
-	return out, shape, nil
+	return &Output{
+		Data:  unsafe.Slice((*float32)(data), numel),
+		Shape: shape,
+		value: outputTensor,
+		ort:   o,
+	}, nil
 }

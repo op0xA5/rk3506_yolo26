@@ -66,19 +66,43 @@ bash scripts/build-onnxruntime-arm.sh                # 按新算子清单重新�
 注意: 算子裁剪后运行**只支持配置中列出的算子**；
 若需保留全部算子 (直接加载任意 .onnx)，用 `MINIMAL_BUILD=OFF OPS_CONFIG="" bash scripts/build-onnxruntime-arm.sh`。
 
-## INT8 量化 NMS-free 模型 (对比测试)
+## INT8 量化 NMS-free 模型 (对比测试 / 低内存推荐)
 
-`yolo26n_nms_int8.ort` 由官方 yolo26n.pt 经 INT8 静态量化 (QDQ/QLinear)
-并烘焙 NMS-free 端到端解码 (TopK) 得到:
+`yolo26n_nms_int8.ort` 由官方 yolo26n.pt 烘焙 NMS-free 端到端解码 (TopK) 后，
+经 **QOperator 格式** INT8 静态量化得到:
 
 - 输出 `[1, 300, 6]` = (x1, y1, x2, y2, score, class)，无需 NMS
-- 模型体积 9.6M -> 3.3M，输入仍为 float32，Go 程序无需修改
+- 模型体积 9.6M -> ~3M，输入仍为 float32，Go 程序无需修改
+- **激活张量全程 int8 传递** (QLinearConv/QLinearMul/QLinearAdd...)，
+  峰值内存约为 fp32 的 1/4，适合 60MB 级内存芯片
 - 导出: `bash scripts/export-model.sh int8`
-  (本质是 `yolo export format=onnx nms=False quantize=int8`，校准数据默认 coco8)
+  (e2e 导出 -> `scripts/quantize-int8.py` 量化; 校准数据默认 ultralytics coco8,
+  建议设 `CALIB_DIR=自己的图片目录` 或用 `python3 scripts/quantize-int8.py --calib-dir DIR`)
 
 对比运行 (宿主机 qemu 模拟，绝对耗时不代表真实芯片):
 `make -C go-yolo26n compare ARGS="-iters 10"`
 目标板上分别用 `-model yolo26n.ort` 与 `-model yolo26n_nms_int8.ort` 运行即可对比。
+
+## 内存说明 (目标芯片可用内存 ~60MB)
+
+1. **32 位 onnxruntime 无内存池**: `allocator_utils.cc` 中 `sizeof(void*)==4`
+   时整体禁用 CPU arena，张量分配全部走 malloc/free，ORT 侧无可调内存池参数。
+2. Go 程序已做零拷贝/复用优化: 输入 OrtValue 只建一次、输出零拷贝视图、
+   预处理缓冲复用、Go 堆软上限 `-memlimit` (默认 16MB)。
+   优化前 (每轮推理拷贝输出+无 GC 限制) 在板端 threads=2 实测约 160MB 峰值。
+3. 实测峰值 (程序内 VmRSS, qemu guest 视角, threads=2):
+
+   | 模型 | 加载后 | 推理峰值 | 推理耗时(qemu) |
+   |---|---|---|---|
+   | yolo26n.ort (fp32 640) | ~40MB | ~58MB | ~8100ms |
+   | yolo26n_nms_int8.ort (int8 640) | ~35MB | ~59MB | ~4200ms |
+   | yolo26n480_nms_int8.ort (int8 480) | ~35MB | ~54MB | ~2500ms |
+
+   注: 宿主机 qemu 进程的 RSS 会比上表高 20~40MB (TCG 指令翻译缓存,
+   可用 `qemu-arm -tb-size 8` 缩小), 不代表真实芯片。
+4. 60MB 芯片建议: **int8 模型** (速度快 2 倍) + `-threads 1~2` +
+   内存紧张时用 480 输入 (`export-model.sh e2e` 前设 `IMGSZ=480` 重新导出量化,
+   或直接用 models/yolo26n480_nms_int8.ort) + 不使用 `-out` 保存标注图。
 
 ## 程序说明
 
