@@ -135,11 +135,14 @@ make ncnn-convert IMGSZ=480   # yolo26n.pt -> yolo26n480.ncnn.param/.bin + int8 
 | onnxruntime | yolo26n480_nms_int8.ort (e2e) | ~2458ms | 0.3ms (解码) | ~40MB |
 | ncnn | yolo26n480-int8 (raw+Go NMS) | ~2538ms | 7.3ms (解码+NMS) | ~24MB |
 | ncnn | yolo26n480 (fp32) | ~7790ms | 7.6ms | ~39MB |
+| onnxruntime（基线） | yolo26n320_nms_int8.ort (e2e) | ~1170ms | 0.3ms | — |
+| ncnn | yolo26n320-int8 (raw+Go NMS) | ~1114ms | 4.9ms (解码+NMS) | ~24MB |
 
 - ncnn int8 较其 fp32 提速 ~3.1x; 检测精度损失可忽略 (int8 漏检 1 个
   conf=0.51 的弱目标, 其余框/分数与 fp32 基本一致)。
 - ncnn 运行时明显更轻 (模型加载后 24MB vs 40MB), 对 60MB 内存芯片更友好;
   端到端总耗时请在目标板上用同一图片实测对比 (`-threads` 建议 1~3)。
+- qemu 复现: `make -C go-ncnn-demo compare` (480) / `compare320` (320)。
 
 ### ncnn 构建要点 (scripts/build-ncnn-arm.sh)
 

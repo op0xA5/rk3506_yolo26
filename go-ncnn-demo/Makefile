@@ -52,6 +52,12 @@ compare: $(TARGET)
 	qemu-arm -L $(SDK)/arm-buildroot-linux-gnueabihf/sysroot ./$(TARGET) \
 	  -model ../models/yolo26n480-int8.ncnn.param -image ../images/bus.jpg $(ARGS)
 
+# 320 分辨率 int8 验证 (原始输出 + Go NMS; 与 onnxruntime 版 compare320 对比)
+compare320: $(TARGET)
+	@echo "================= INT8 ncnn 320: yolo26n320-int8 ================"
+	qemu-arm -L $(SDK)/arm-buildroot-linux-gnueabihf/sysroot ./$(TARGET) \
+	  -model ../models/yolo26n320-int8.ncnn.param -image ../images/bus.jpg -size 320 $(ARGS)
+
 # 与 onnxruntime 版 (go-yolo26n) 对比需在板端分别运行两个二进制,
 # onnxruntime int8 端到端基线 (480, threads=3):
 #   图片解码 110ms + 预处理 344ms + 推理 1318ms + 后处理 0.08ms = 1772ms
