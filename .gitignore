@@ -22,3 +22,4 @@ go-ncnn-demo/ncnn-demo
 # 编辑器 / 系统
 *.swp
 .DS_Store
+models/*.table.headfp32

@@ -116,11 +116,14 @@ bash scripts/convert-model.sh models/*.onnx     # 注意: 传入所有在用模�
 构建与转换:
 ```bash
 pip3 install --user --break-system-packages pnnx   # 模型转换 (官方维护路径)
-make ncnn                 # 交叉编译 libncnn.a + go-ncnn-demo (首次自动克隆 ncnn)
-make ncnn-convert IMGSZ=480   # yolo26n.pt -> yolo26n480.ncnn.param/.bin + int8 量化
+make ncnn                     # 交叉编译 libncnn.a + go-ncnn-demo (首次自动克隆 ncnn)
+bash scripts/build-ncnn-host-tools.sh              # 一次性: 宿主机量化工具链
+make ncnn-convert IMGSZ=480   # yolo26n.pt -> fp32 + int8 量化 (默认检测头 fp32 混合精度)
+FULL_INT8=1 make ncnn-convert IMGSZ=480            # 检测头也量化 (再快 ~15%, 精度略降)
 ```
-转换链: ultralytics 导出 torchscript -> **pnnx** 转 ncnn -> ncnn2table 校准
--> ncnn2int8。不用 onnx2ncnn: 它对 YOLO26 检测头的 Shape/Gather/动态 Slice
+转换链: ultralytics 导出 torchscript -> **pnnx** 转 ncnn -> ncnn2table 权重 scale
+-> **ncnncalib 激活 scale** (absmax, 与运行时一致的 letterbox 预处理, coco128
+校准集) -> ncnn2int8。不用 onnx2ncnn: 它对 YOLO26 检测头的 Shape/Gather/动态 Slice
 烘焙子图支持不完整 (fp16 守卫编译失败 + 转换后输出 NaN)，pnnx 能正确折叠。
 
 板端运行:
@@ -128,21 +131,44 @@ make ncnn-convert IMGSZ=480   # yolo26n.pt -> yolo26n480.ncnn.param/.bin + int8 
 ./ncnn-demo -model yolo26n480-int8.ncnn.param -size 480 -threads 3 -image bus.jpg
 ```
 
-### qemu 对比 (480, int8, threads=2; 绝对值不代表真实芯片)
+### qemu 对比 (480/320 int8, threads=2; 绝对值不代表真实芯片)
 
 | 引擎 | 模型 | 推理 | 后处理 | 加载后 VmRSS |
 |---|---|---|---|---|
-| onnxruntime | yolo26n480_nms_int8.ort (e2e) | ~2458ms | 0.3ms (解码) | ~40MB |
-| ncnn | yolo26n480-int8 (raw+Go NMS) | ~2538ms | 7.3ms (解码+NMS) | ~24MB |
+| onnxruntime（基线） | yolo26n480_nms_int8.ort (e2e) | ~2458ms | 0.3ms (解码) | ~40MB |
+| ncnn | yolo26n480-int8 (raw+Go NMS) | ~2953ms | 7.3ms (解码+NMS) | ~24MB |
 | ncnn | yolo26n480 (fp32) | ~7790ms | 7.6ms | ~39MB |
 | onnxruntime（基线） | yolo26n320_nms_int8.ort (e2e) | ~1170ms | 0.3ms | — |
-| ncnn | yolo26n320-int8 (raw+Go NMS) | ~1114ms | 4.9ms (解码+NMS) | ~24MB |
+| ncnn | yolo26n320-int8 (raw+Go NMS) | ~1290ms | 4.9ms (解码+NMS) | ~24MB |
 
-- ncnn int8 较其 fp32 提速 ~3.1x; 检测精度损失可忽略 (int8 漏检 1 个
-  conf=0.51 的弱目标, 其余框/分数与 fp32 基本一致)。
-- ncnn 运行时明显更轻 (模型加载后 24MB vs 40MB), 对 60MB 内存芯片更友好;
-  端到端总耗时请在目标板上用同一图片实测对比 (`-threads` 建议 1~3)。
+- ncnn int8 (检测头 fp32 混合精度) 较其 fp32 提速 ~2.6x, 全 int8
+  (`FULL_INT8=1`) 再快 ~15%; 运行时更轻 (加载后 24MB vs 40MB), 对 60MB
+  内存芯片更友好; 端到端总耗时请在目标板上用同一图片实测对比。
 - qemu 复现: `make -C go-ncnn-demo compare` (480) / `compare320` (320)。
+
+### int8 精度说明 (bus.jpg, conf=0.25)
+
+默认 int8 模型采用 **absmax 校准 + 检测头 fp32 混合精度**, 与 onnxruntime
+QOperator int8 精度基本一致:
+
+| 模型 | 检出 | 分数 (括号内 onnxruntime int8 基线) |
+|---|---|---|
+| ncnn 480-int8 (旧校准) | 4 个 | 0.86/0.80/0.68/0.59 |
+| **ncnn 480-int8 (新, 默认)** | 5 个 | 0.87/0.84/0.78/0.77/0.55 (0.89/0.85/0.80/0.80/0.54) |
+| ncnn 320-int8 (旧校准) | 4 个 | bus 仅 0.67 |
+| **ncnn 320-int8 (新, 默认)** | 5 个 | bus 0.82 (0.81) |
+
+精度排查结论:
+1. **激活 scale 被 clipping 是主因**: ncnn2table 用直方图分位数定裁剪阈值,
+   对校准集外输入 (如颜色饱和图片) 大面积 clipping, 逐层对比实测部分层
+   int8 输出退化为全零。自定义校准器 `tools/ncnncalib.cpp` 改用
+   **absmax 统计 + scale=127/absmax** (与 ncnn 表语义一致), 并用与运行时
+   完全一致的 letterbox 预处理 + coco128 (128 张) 校准集。
+2. **检测头对量化最敏感**: 分数/坐标由 head 卷积直接输出, 全 int8 时即使
+   校准修复仍有 0.05~0.1 分数损失; 默认将 cv2/cv3 towers 保持 fp32
+   (计算量占比 <5%, qemu 推理仅慢 ~15%), `FULL_INT8=1` 可关闭。
+3. 该误差与推理内核无关: 宿主机 x86 上复现同样分数下降, 排除 ARM NEON
+   内核问题; 权重 scale (per-channel, 来自 ncnn2table) 质量良好, 未改动。
 
 ### ncnn 构建要点 (scripts/build-ncnn-arm.sh)
 
